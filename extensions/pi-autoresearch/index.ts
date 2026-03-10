@@ -108,6 +108,9 @@ function isBetter(
 // ---------------------------------------------------------------------------
 
 export default function autoresearchExtension(pi: ExtensionAPI) {
+  // Listener for dashboard live updates
+  let onStateChange: (() => void) | null = null;
+
   let state: ExperimentState = {
     results: [],
     bestMetric: null,
@@ -346,6 +349,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       updateWidget(ctx);
+      onStateChange?.();
 
       let text = `Logged #${state.totalExperiments}: ${experiment.status} — ${experiment.description}`;
       if (state.bestMetric !== null) {
@@ -417,8 +421,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-        const dashboard = new DashboardComponent(state, theme, () => done());
-        dashboard.tui = tui;
+        const dashboard = new DashboardComponent(state, theme, () => {
+          onStateChange = null;
+          done();
+        });
+        onStateChange = () => {
+          dashboard.invalidate();
+          tui.requestRender?.();
+        };
         return dashboard;
       });
     },
@@ -435,29 +445,14 @@ class DashboardComponent {
   private onClose: () => void;
   private cachedWidth?: number;
   private cachedLines?: string[];
-  private lastSeenCount: number;
-  private timer: ReturnType<typeof setInterval> | null = null;
-  public tui: any = null;
-
   constructor(state: ExperimentState, theme: Theme, onClose: () => void) {
     this.state = state;
     this.theme = theme;
     this.onClose = onClose;
-    this.lastSeenCount = state.totalExperiments;
-
-    // Poll every 5s — if state changed, invalidate and re-render
-    this.timer = setInterval(() => {
-      if (this.state.totalExperiments !== this.lastSeenCount) {
-        this.lastSeenCount = this.state.totalExperiments;
-        this.invalidate();
-        this.tui?.requestRender?.();
-      }
-    }, 5000);
   }
 
   handleInput(data: string): void {
     if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-      if (this.timer) clearInterval(this.timer);
       this.onClose();
     }
   }
