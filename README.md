@@ -24,7 +24,11 @@ skills/autoresearch-create/SKILL.md — meta-skill to generate domain-specific s
 
 ## Install
 
-Copy into your pi agent directory:
+```bash
+pi install https://github.com/shopify-playground/pi-autoresearch
+```
+
+Or manually:
 
 ```bash
 # Extension
