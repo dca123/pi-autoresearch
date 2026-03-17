@@ -648,9 +648,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             for (const name of Object.keys(entry.metrics ?? {})) {
               if (!state.secondaryMetrics.find((m) => m.name === name)) {
                 let unit = "";
-                if (name.endsWith("_µs") || name.includes("µs")) unit = "µs";
-                else if (name.endsWith("_ms") || name.includes("ms")) unit = "ms";
-                else if (name.endsWith("_s") || name.includes("sec")) unit = "s";
+                if (name.endsWith("µs")) unit = "µs";
+                else if (name.endsWith("_ms")) unit = "ms";
+                else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
+                else if (name.endsWith("_kb")) unit = "kb";
+                else if (name.endsWith("_mb")) unit = "mb";
                 state.secondaryMetrics.push({ name, unit });
               }
             }
@@ -1326,9 +1328,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       for (const name of Object.keys(secondaryMetrics)) {
         if (!state.secondaryMetrics.find((m) => m.name === name)) {
           let unit = "";
-          if (name.endsWith("_µs") || name.includes("µs")) unit = "µs";
-          else if (name.endsWith("_ms") || name.includes("ms")) unit = "ms";
-          else if (name.endsWith("_s") || name.includes("sec")) unit = "s";
+          if (name.endsWith("µs")) unit = "µs";
+          else if (name.endsWith("_ms")) unit = "ms";
+          else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
+          else if (name.endsWith("_kb")) unit = "kb";
+          else if (name.endsWith("_mb")) unit = "mb";
           state.secondaryMetrics.push({ name, unit });
         }
       }
