@@ -242,7 +242,8 @@ function killTree(pid: number): void {
 /** Check if a command string is running autoresearch.sh (or ./autoresearch.sh) */
 function isAutoresearchShCommand(command: string): boolean {
   const trimmed = command.trim();
-  return /(?:^|\s)(?:\.\/)?autoresearch\.sh(?:\s|$)/.test(trimmed);
+  // Match: autoresearch.sh as first token, or preceded by bash/sh/source/./ 
+  return /(?:^|&&|;|\|)\s*(?:bash\s+|sh\s+|source\s+|\.\/)?autoresearch\.sh(?:\s|$)/.test(trimmed);
 }
 
 function isBetter(
@@ -1326,20 +1327,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           chunks.push(data);
           chunksBytes += data.length;
 
-          // Evict old chunks but never mid-line: find the first newline in the
-          // oldest surviving chunk and trim up to (and including) it so the
-          // buffer always starts at a line boundary. This also avoids splitting
-          // multi-byte UTF-8 characters that straddle chunk boundaries.
+          // Evict old chunks, then trim the first surviving chunk to a line
+          // boundary. This avoids splitting multi-byte UTF-8 characters that
+          // straddle chunk boundaries (which would produce U+FFFD on decode).
           while (chunksBytes > maxChunksBytes && chunks.length > 1) {
             const removed = chunks.shift()!;
             chunksBytes -= removed.length;
           }
-          if (chunksBytes > maxChunksBytes && chunks.length === 1) {
+          // Trim first surviving chunk to a newline boundary
+          if (chunks.length > 0 && chunksBytes > maxChunksBytes) {
             const buf = chunks[0];
             const nlIdx = buf.indexOf(0x0a); // '\n'
             if (nlIdx !== -1 && nlIdx < buf.length - 1) {
               chunks[0] = buf.subarray(nlIdx + 1);
-              chunksBytes = chunks[0].length;
+              chunksBytes -= nlIdx + 1;
             }
           }
 
