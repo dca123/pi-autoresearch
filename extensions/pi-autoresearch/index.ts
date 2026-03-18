@@ -1425,10 +1425,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }, timeout);
         }
 
-        // Abort signal — also handle race where signal fires before pid is assigned
+        // Abort signal — kill immediately if pid exists, otherwise queue for spawn.
+        // Using child.kill() as fallback ensures the signal is never silently swallowed.
         const onAbort = () => {
           if (child.pid) killTree(child.pid);
-          else child.once("spawn", () => { if (child.pid) killTree(child.pid); });
+          else {
+            // pid not yet assigned — try child.kill() which works without pid,
+            // and also queue killTree for spawn in case child.kill() isn't enough
+            // to clean up the full process tree.
+            child.kill();
+            child.once("spawn", () => { if (child.pid) killTree(child.pid); });
+          }
         };
         if (signal) {
           if (signal.aborted) {
