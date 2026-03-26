@@ -42,6 +42,9 @@ info() { echo -e "${GREEN}$1${NC}"; }
 cleanup_data() { if [ -d "${DATA_DIR:-}" ]; then rm -rf "$DATA_DIR"; fi; }
 fail() { cleanup_data; echo -e "${RED}ERROR: $1${NC}" >&2; exit 1; }
 
+# Session artifacts are matched by basename so they're excluded regardless of
+# directory depth — autoresearch runs may happen in subdirectories (e.g.
+# libs/polaris/autoresearch.jsonl) and none should leak into PR branches.
 is_session_file() {
   local base
   base=$(basename "$1")
@@ -56,6 +59,8 @@ parse_groups() {
   local groups_file="$1"
   [ -f "$groups_file" ] || fail "$groups_file not found"
 
+  # Serialize JSON fields into flat files so bash can consume them without jq.
+  # Node is already a dependency (used by the extension), so no new dep required.
   DATA_DIR=$(mktemp -d)
   node -e "
 const fs = require('fs');
@@ -226,6 +231,8 @@ create_group_branch() {
     return
   fi
 
+  # Start from merge-base (not the previous group) so each branch is
+  # independently mergeable — reviewers can land them in any order.
   git checkout "$BASE" --quiet --detach 2>/dev/null || git checkout "$BASE" --quiet
   git checkout -b "$branch_name"
 
@@ -256,6 +263,8 @@ create_branches() {
   info "Created ${#CREATED_BRANCHES[@]} branches (all from merge-base, independent):"
   for branch in "${CREATED_BRANCHES[@]}"; do echo "  $branch"; done
 
+  # Disarm rollback — creation succeeded. Verify failures intentionally leave
+  # branches intact so the user can inspect and fix manually.
   trap - EXIT
 }
 
@@ -277,6 +286,8 @@ verify_union_matches_original() {
       git checkout "$last_commit" -- "$changed_file"
     done
   done
+  # --allow-empty: when all groups cover all files, the checkout leaves
+  # nothing staged — the diff against FINAL_TREE is what matters, not this commit.
   git commit --allow-empty -m "verify: union of all groups" --quiet
 
   local non_session_diff=""
