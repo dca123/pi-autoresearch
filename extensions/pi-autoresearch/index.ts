@@ -32,6 +32,16 @@ import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 
+import {
+  runHook,
+  steerMessageFor,
+  hookLogEntry,
+  type HookStage,
+  type HookResult,
+  type HookPayload,
+  type SessionSnapshot,
+} from "./hooks.js";
+
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
 // ---------------------------------------------------------------------------
@@ -466,7 +476,7 @@ interface AutoresearchConfig {
 /** Read autoresearch.config.json from the given directory (always ctx.cwd) */
 function readConfig(cwd: string): AutoresearchConfig {
   try {
-    const configPath = path.join(cwd, "autoresearch.config.json");
+    const configPath = autoresearchConfigPath(cwd);
     if (!fs.existsSync(configPath)) return {};
     return JSON.parse(fs.readFileSync(configPath, "utf-8"));
   } catch {
@@ -518,6 +528,30 @@ function findBaselineMetric(results: ExperimentResult[], segment: number): numbe
   const cur = currentResults(results, segment);
   return cur.length > 0 ? cur[0].metric : null;
 }
+
+/** Best = optimal metric across kept experiments in current segment (min for lower, max for higher) */
+function findBestMetric(
+  results: ExperimentResult[],
+  segment: number,
+  direction: "lower" | "higher",
+): number | null {
+  const kept = currentResults(results, segment)
+    .filter((r) => r.status === "keep")
+    .map((r) => r.metric);
+  if (kept.length === 0) return null;
+  return direction === "lower" ? Math.min(...kept) : Math.max(...kept);
+}
+
+// -----------------------------------------------------------------------
+// Session file paths (single source of truth for autoresearch.* filenames)
+// -----------------------------------------------------------------------
+
+const autoresearchJsonlPath  = (dir: string) => path.join(dir, "autoresearch.jsonl");
+const autoresearchMdPath     = (dir: string) => path.join(dir, "autoresearch.md");
+const autoresearchIdeasPath  = (dir: string) => path.join(dir, "autoresearch.ideas.md");
+const autoresearchChecksPath = (dir: string) => path.join(dir, "autoresearch.checks.sh");
+const autoresearchScriptPath = (dir: string) => path.join(dir, "autoresearch.sh");
+const autoresearchConfigPath = (dir: string) => path.join(dir, "autoresearch.config.json");
 
 function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
   const index = results.findIndex((result) => result.segment === segment);
@@ -1082,7 +1116,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const hasIdeasFile = (ctx: ExtensionContext): boolean =>
-    fs.existsSync(path.join(resolveWorkDir(ctx.cwd), "autoresearch.ideas.md"));
+    fs.existsSync(autoresearchIdeasPath(resolveWorkDir(ctx.cwd)));
 
   const composeResumeMessage = (ctx: ExtensionContext): string => {
     const parts = [
@@ -1104,7 +1138,55 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const hasAutoresearchRules = (ctx: ExtensionContext): boolean =>
-    fs.existsSync(path.join(resolveWorkDir(ctx.cwd), "autoresearch.md"));
+    fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)));
+
+  const readJsonlLines = (workDir: string): string[] => {
+    const jsonlPath = autoresearchJsonlPath(workDir);
+    if (!fs.existsSync(jsonlPath)) return [];
+    return fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
+  };
+
+  const parseRunEntry = (line: string): Record<string, unknown> | null => {
+    try {
+      const entry = JSON.parse(line);
+      return typeof entry.run === "number" ? entry : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const readLastRun = (workDir: string): Record<string, unknown> | null => {
+    const lines = readJsonlLines(workDir);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const entry = parseRunEntry(lines[i]);
+      if (entry) return entry;
+    }
+    return null;
+  };
+
+  const buildSessionSnapshot = (state: ExperimentState): SessionSnapshot => ({
+    metric_name: state.metricName,
+    metric_unit: state.metricUnit,
+    direction: state.bestDirection,
+    baseline_metric: state.bestMetric,
+    best_metric: findBestMetric(state.results, state.currentSegment, state.bestDirection),
+    run_count: state.results.length,
+    goal: state.name ?? "",
+  });
+
+  const appendHookLogEntry = (workDir: string, stage: HookStage, result: HookResult): void => {
+    if (!result.fired) return;
+    try {
+      const jsonlPath = autoresearchJsonlPath(workDir);
+      fs.appendFileSync(jsonlPath, JSON.stringify(hookLogEntry(stage, result)) + "\n");
+    } catch {}
+  };
+
+  const fireHook = async (payload: HookPayload): Promise<string | null> => {
+    const result = await runHook(payload);
+    appendHookLogEntry(payload.cwd, payload.event, result);
+    return steerMessageFor(payload.event, result);
+  };
 
   // Running experiment state (for spinner in fullscreen overlay)
   let overlayTui: { requestRender: () => void } | null = null;
@@ -1166,7 +1248,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const workDir = resolveWorkDir(ctx.cwd);
 
     // Primary: read from autoresearch.jsonl (alongside autoresearch.md/sh)
-    const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+    const jsonlPath = autoresearchJsonlPath(workDir);
     let loadedFromJsonl = false;
     try {
       if (fs.existsSync(jsonlPath)) {
@@ -1268,7 +1350,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
+    runtime.autoresearchMode = fs.existsSync(autoresearchJsonlPath(workDir));
 
     updateWidget(ctx);
   };
@@ -1486,11 +1568,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!runtime.autoresearchMode) return;
 
     const workDir = resolveWorkDir(ctx.cwd);
-    const mdPath = path.join(workDir, "autoresearch.md");
-    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
+    const mdPath = autoresearchMdPath(workDir);
+    const ideasPath = autoresearchIdeasPath(workDir);
     const hasIdeas = fs.existsSync(ideasPath);
 
-    const checksPath = path.join(workDir, "autoresearch.checks.sh");
+    const checksPath = autoresearchChecksPath(workDir);
     const hasChecks = fs.existsSync(checksPath);
 
     let extra =
@@ -1575,7 +1657,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Write config header to jsonl (append for re-init, create for first)
       const workDir = resolveWorkDir(ctx.cwd);
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+        const jsonlPath = autoresearchJsonlPath(workDir);
         const config = JSON.stringify({
           type: "config",
           name: state.name,
@@ -1599,9 +1681,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      const wasInactive = !runtime.autoresearchMode;
       runtime.autoresearchMode = true;
       runtime.iterationStartTokens = ctx.getContextUsage()?.tokens ?? null;
       updateWidget(ctx);
+
+      if (wasInactive) {
+        const steer = await fireHook({
+          event: "before",
+          cwd: workDir,
+          next_run: state.results.length + 1,
+          last_run: readLastRun(workDir),
+          session: buildSessionSnapshot(state),
+        });
+        if (steer) pi.sendUserMessage(steer, { deliverAs: "steer" });
+      }
 
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
@@ -1674,7 +1768,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
       // Guard: if autoresearch.sh exists, only allow running it
-      const autoresearchShPath = path.join(workDir, "autoresearch.sh");
+      const autoresearchShPath = autoresearchScriptPath(workDir);
       if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
         return {
           content: [{
@@ -1887,7 +1981,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let checksOutput = "";
       let checksDuration = 0;
 
-      const checksPath = path.join(workDir, "autoresearch.checks.sh");
+      const checksPath = autoresearchChecksPath(workDir);
       if (benchmarkPassed && fs.existsSync(checksPath)) {
         const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
@@ -2381,46 +2475,60 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      // Persist to autoresearch.jsonl (always, regardless of status)
+      const jsonlEntry: Record<string, unknown> = {
+        run: state.results.length,
+        ...experiment,
+      };
+      if (!mergedASI) delete jsonlEntry.asi;
+      const jsonlLine = JSON.stringify(jsonlEntry);
+
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
-        const jsonlEntry: Record<string, unknown> = {
-          run: state.results.length,
-          ...experiment,
-        };
-        // Only write asi if present (keep lines compact when no ASI)
-        if (!mergedASI) delete jsonlEntry.asi;
-        fs.appendFileSync(jsonlPath, JSON.stringify(jsonlEntry) + "\n");
+        fs.appendFileSync(autoresearchJsonlPath(workDir), jsonlLine + "\n");
         broadcastDashboardUpdate(workDir);
       } catch (e) {
         text += `\n⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files
       if (params.status !== "keep") {
         try {
-          const protectedFiles = ["autoresearch.jsonl", "autoresearch.md", "autoresearch.ideas.md", "autoresearch.sh", "autoresearch.checks.sh"];
-          const stageCmd = protectedFiles.map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
-          await pi.exec("bash", ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`], { cwd: workDir, timeout: 10000 });
+          const revertScript = `
+            git checkout -- . ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+            git clean -fd -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
+          `;
+          await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
           text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
         } catch (e) {
           text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
         }
       }
 
-      // Clear running experiment and checks state (log_experiment consumes the run)
+      const afterSteer = await fireHook({
+        event: "after",
+        cwd: workDir,
+        run_entry: jsonlEntry,
+        session: buildSessionSnapshot(state),
+      });
+      if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
+
       const wallClockSeconds = runtime.lastRunDuration;
       runtime.runningExperiment = null;
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
 
-
-      // Check if max experiments limit reached
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         runtime.autoresearchMode = false;
         ctx.abort();
+      } else if (runtime.autoresearchMode) {
+        const beforeSteer = await fireHook({
+          event: "before",
+          cwd: workDir,
+          next_run: state.results.length + 1,
+          last_run: jsonlEntry,
+          session: buildSessionSnapshot(state),
+        });
+        if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
       }
 
       updateWidget(ctx);
@@ -2524,7 +2632,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
       if (state.results.length === 0) {
-        if (!runtime.autoresearchMode && !fs.existsSync(path.join(resolveWorkDir(ctx.cwd), "autoresearch.md"))) {
+        if (!runtime.autoresearchMode && !fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)))) {
           ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
         } else {
           ctx.ui.notify("No experiments yet", "info");
@@ -2714,7 +2822,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   function readJsonlContent(workDir: string): string {
-    return fs.readFileSync(path.join(workDir, "autoresearch.jsonl"), "utf-8").trim();
+    return fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8").trim();
   }
 
   function extractSessionName(jsonlContent: string): string {
@@ -2806,7 +2914,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   function resolveServedFile(workDir: string, requestPath: string): string | null {
     if (requestPath === "/") return dashboardServerHtmlPath;
-    if (requestPath === "/autoresearch.jsonl") return path.join(workDir, "autoresearch.jsonl");
+    if (requestPath === "/autoresearch.jsonl") return autoresearchJsonlPath(workDir);
     return null;
   }
 
@@ -2891,7 +2999,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   async function exportDashboard(ctx: ExtensionContext): Promise<void> {
     const workDir = resolveWorkDir(ctx.cwd);
-    const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+    const jsonlPath = autoresearchJsonlPath(workDir);
 
     if (!fs.existsSync(jsonlPath)) {
       ctx.ui.notify("No autoresearch.jsonl found \u2014 run some experiments first", "error");
@@ -2957,7 +3065,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "clear") {
-        const jsonlPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.jsonl");
+        const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
         runtime.autoresearchMode = false;
         runtime.dashboardExpanded = false;
         runtime.lastAutoResumeTime = 0;
@@ -2994,13 +3102,29 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.autoresearchMode = true;
       runtime.autoResumeTurns = 0;
 
-      if (hasAutoresearchRules(ctx)) {
-        ctx.ui.notify("Autoresearch mode ON — rules loaded from autoresearch.md", "info");
-        sendWhenReady(ctx, `Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`);
-      } else {
-        ctx.ui.notify("Autoresearch mode ON — no autoresearch.md found, setting up", "info");
-        sendWhenReady(ctx, `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`);
-      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const rulesLoaded = hasAutoresearchRules(ctx);
+      const kickoff = rulesLoaded
+        ? `Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
+        : `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`;
+
+      ctx.ui.notify(
+        rulesLoaded
+          ? "Autoresearch mode ON — rules loaded from autoresearch.md"
+          : "Autoresearch mode ON — no autoresearch.md found, setting up",
+        "info",
+      );
+
+      const state = runtime.state;
+      const activationSteer = await fireHook({
+        event: "before",
+        cwd: workDir,
+        next_run: state.results.length + 1,
+        last_run: readLastRun(workDir),
+        session: buildSessionSnapshot(state),
+      });
+
+      sendWhenReady(ctx, activationSteer ? `${activationSteer}\n\n${kickoff}` : kickoff);
     },
   });
 }
