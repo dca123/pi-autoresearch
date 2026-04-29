@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-04-29
+
+### Added
+
+- Deterministic compaction summary. When pi compacts context, autoresearch now bypasses the LLM summarization and injects a lossless markdown summary built from persisted state (experiment rules, ideas backlog, and last 50 runs with ASI fields). This eliminates information loss across compaction boundaries.
+- Recent-run deltas in the compaction summary use the full segment baseline, not just the first visible run in the window — percentages stay accurate even for long sessions.
+- New test coverage for compaction summary assembly, empty state, re-init segments, 50-run cap, and hidden-baseline delta correctness.
+
+### Fixed
+
+- Post-turn auto-resume no longer tells the agent "don't re-read files" when no compaction happened. Split into two resume messages: a generic one for normal turns and a compaction-specific one that correctly references the summary.
+
 ## [1.2.0] - 2026-04-28
 
 ### Changed
